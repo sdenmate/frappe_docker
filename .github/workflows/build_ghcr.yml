@@ -4,15 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       frappe_branch:
-        description: "Frappe version-v16"
+        description: "Frappe version"
         required: false
         default: "version-16"
       image_tag:
-        description: "description tag"
+        description: "Image tag"
         required: false
         default: "latest"
 
-# 推 GHCR 需要 packages: write
 permissions:
   contents: read
   packages: write
@@ -23,11 +22,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        # 若你的 apps.json 在某个特定分支（例如 chen），取消下面注释：
         with:
           ref: chen
 
-      # 校验【提交的】apps.json（此处不含令牌，可放心入库）
       - name: Validate apps.json syntax
         run: |
           if ! jq -e . ./apps.json >/dev/null; then
@@ -35,22 +32,24 @@ jobs:
             exit 1
           fi
 
-      # 运行期把 Gitee 令牌注入到临时 apps.build.json
-      # 令牌来自 secrets.GITEE_PAT，只存在于本次构建，不进仓库、不进镜像
-      # 仅对 gitee.com 的 URL 注入；github.com 等其它条目原样保留
       - name: Inject Gitee token (runtime only)
         env:
           GITEE_PAT: ${{ secrets.GITEE_PAT }}
         run: |
-          # 仅对 gitee.com 的 URL 注入 oauth2 令牌前缀（与你示例一致）
           jq --arg token "$GITEE_PAT" '
             map(if (.url // "" | startswith("https://gitee.com"))
                 then .url = ("https://oauth2:" + $token + "@" + (.url | sub("^https://";"")))
                 else . end)
           ' ./apps.json > ./apps.build.json
           echo "已生成 apps.build.json（含令牌，仅用于本次构建，不会入库）"
-          # 打印脱敏后的 URL 确认替换生效，且不泄露令牌
           jq -c 'map(.url | sub("https://[^@]+@"; "https://***@"))' ./apps.build.json
+
+      - name: Compute apps.json cache key
+        id: apps_hash
+        run: |
+          HASH=$(sha256sum ./apps.json | cut -d' ' -f1)
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "apps.json sha256 = $HASH"
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -64,7 +63,7 @@ jobs:
 
       - name: Build & Push layered image
         id: docker_build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./images/layered/Containerfile
@@ -75,17 +74,15 @@ jobs:
           build-args: |
             FRAPPE_PATH=https://github.com/frappe/frappe
             FRAPPE_BRANCH=${{ github.event.inputs.frappe_branch }}
-          secrets: |
-            # 传入【运行期生成】的 apps.build.json，里面才含令牌
-            id=apps_json,src=${{ github.workspace }}/apps.build.json
+            CACHE_BUST=${{ steps.apps_hash.outputs.hash }}
+          secret-files: |
+            apps_json=${{ github.workspace }}/apps.build.json
 
-      # 打印 digest 到日志
       - name: Print image digest
         run: |
           echo "Image digest: ${{ steps.docker_build.outputs.digest }}"
           echo "Full image: ghcr.io/${{ github.repository_owner }}/frappe@${{ steps.docker_build.outputs.digest }}"
 
-      # 写入 Job Summary
       - name: Write summary
         run: |
           echo "### 📦 构建镜像信息" >> $GITHUB_STEP_SUMMARY
@@ -93,3 +90,4 @@ jobs:
           echo "- **Digest**: \`${{ steps.docker_build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **完整镜像地址**:" >> $GITHUB_STEP_SUMMARY
           echo "\`ghcr.io/${{ github.repository_owner }}/frappe@${{ steps.docker_build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+
